@@ -37,8 +37,6 @@
 #include <cstdio>
 #include <cmath>
 
-using namespace plugin;
-
 MYMODCFG(net.psdk.customhud.guid, Custom HUD, 1.0, YourName)
 
 // ----------------------------------------------------------------------------
@@ -202,13 +200,17 @@ DECL_HOOKv(CWidgetPlayerInfo__Draw, void* thisWidget)
     // Mode custom: SKIP fungsi asli sepenuhnya, gambar semua dari nol.
     // (Efeknya: jam & bintang wanted tidak tampil di mode ini.)
 
-    CPed* pPed = FindPlayerPed(-1);
+    CPlayerPed* pPed = FindPlayerPed(-1);
     if (pPed)
     {
+        // m_PlayerData ada di CPlayerInfo (bukan di CPed/CPlayerPed), jadi
+        // diakses lewat CWorld::Players, bukan lewat pPed langsung.
+        CPlayerInfo& pInfo = CWorld::Players[(u8)CWorld::PlayerInFocus];
+
         DrawCustomBar(g_HealthBar, pPed->m_fHealth);
         DrawCustomBar(g_ArmorBar, pPed->m_fArmour);
-        DrawCustomBar(g_BreathBar, pPed->m_PlayerData.m_fBreath);      // [VERIFY skala max]
-        DrawCustomBar(g_SprintBar, pPed->m_PlayerData.m_fTimeCanRun);  // [VERIFY skala max]
+        DrawCustomBar(g_BreathBar, pInfo.m_PlayerData.m_fBreath);      // [VERIFY skala max]
+        DrawCustomBar(g_SprintBar, pInfo.m_PlayerData.m_fTimeCanRun);  // [VERIFY skala max]
 
         if (g_WeaponIcon.enabled)
         {

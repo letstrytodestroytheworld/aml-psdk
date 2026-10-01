@@ -33,6 +33,7 @@
 #include <aml-psdk/game_sa/entity/PlayerPed.h>
 #include <aml-psdk/game_sa/entity/Vehicle.h>
 #include <aml-psdk/game_sa/engine/World.h>
+#include <aml-psdk/gta_base/Rect.h>
 #include <string>
 #include <cstdio>
 #include <cmath>
@@ -105,12 +106,12 @@ static void LoadBarConfig(BarConfig& bar, const char* section)
 static inline auto CWidgetPlayerInfo_Draw_Sym =
     GetMainLibrarySymbol<void(*)(void*)>("_ZN17CWidgetPlayerInfo4DrawEv");
 
-// DrawWeaponIcon(param1_tidak_jelas, pPed, x1, y1, x2, y2, alpha) -- [VERIFY]
+// DrawWeaponIcon(CPed*, CRect, float) -- sudah dikonfirmasi lewat IDA (baris
+// EXPORT), ini method non-static CWidgetPlayerInfo, jadi tetap butuh "this"
+// (widget) sebagai argumen pertama (implicit this di ABI fastcall ARM).
 static inline auto DrawWeaponIcon_Sym =
-    GetMainLibrarySymbol<void(*)(int, CPed*, float, float, float, float, float)>(
-        "_ZN17CWidgetPlayerInfo14DrawWeaponIconEP4CPedffffh"); // nama mungkin perlu
-                                                                 // disesuaikan, cek
-                                                                 // Functions window IDA
+    GetMainLibrarySymbol<void(*)(void*, CPed*, CRect, float)>(
+        "_ZN17CWidgetPlayerInfo14DrawWeaponIconEP4CPed5CRectf");
 
 // ----------------------------------------------------------------------------
 // Money separator (logic sama seperti moneySeparator.cpp)
@@ -214,11 +215,20 @@ DECL_HOOKv(CWidgetPlayerInfo__Draw, void* thisWidget)
 
         if (g_WeaponIcon.enabled)
         {
-            DrawWeaponIcon_Sym(0, pPed,
-                g_WeaponIcon.posX, g_WeaponIcon.posY,
-                g_WeaponIcon.posX + g_WeaponIcon.sizeX,
-                g_WeaponIcon.posY + g_WeaponIcon.sizeY,
-                255.0f);
+            if (DrawWeaponIcon_Sym)
+            {
+                CRect rect(g_WeaponIcon.posX, g_WeaponIcon.posY,
+                           g_WeaponIcon.posX + g_WeaponIcon.sizeX,
+                           g_WeaponIcon.posY + g_WeaponIcon.sizeY);
+                DrawWeaponIcon_Sym(thisWidget, pPed, rect, 255.0f);
+            }
+            else
+            {
+                // Simbol DrawWeaponIcon belum ketemu/salah nama -- matikan
+                // otomatis supaya tidak crash berulang, sampai nama simbol
+                // yang benar dikonfirmasi lewat IDA.
+                g_WeaponIcon.enabled = false;
+            }
         }
     }
 
@@ -298,6 +308,9 @@ ON_MOD_LOAD()
     }
 
     HOOK(CWidgetPlayerInfo__Draw, CWidgetPlayerInfo_Draw_Sym);
+
+    if (!DrawWeaponIcon_Sym)
+        logger->Error("DrawWeaponIcon symbol NOT FOUND -- WeaponIcon dinonaktifkan otomatis. Perlu cek nama simbol yang benar di IDA.");
 
     logger->Info("Custom HUD loaded (fully independent layout mode).");
 }

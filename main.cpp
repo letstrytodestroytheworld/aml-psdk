@@ -77,8 +77,11 @@ struct MoneyConfig
     std::string centSeparator = ".";
 } g_Money;
 
-bool g_bEnabled = true;
-bool g_bUseCustomLayout = true;
+bool  g_bEnabled = true;
+bool  g_bUseCustomLayout = true;
+
+int g_FontStyle = FONT_GOTHIC; // 0=Gothic, 1=Subtitles, 2=Menu, 3=Pricedown
+int g_VehBarDisplayMode = 1;   // 1 = tampilkan 0-100 (normalisasi), 2 = tampilkan 0-1000 (nilai asli)
 
 // ----------------------------------------------------------------------------
 // Helper: load 1 BarConfig dari section config
@@ -157,9 +160,29 @@ static std::string AddSeparators(std::string aValue)
 }
 
 // ----------------------------------------------------------------------------
+// Reset SEMUA state CFont yang relevan sebelum print -- GTA SA pakai state
+// font GLOBAL (bukan per-panggilan), jadi kalau ada elemen lain (misal nama
+// kendaraan/zona yang muncul saat masuk/keluar mobil) ganti style/orientation/
+// justify sebelum giliran kita gambar, teks kita bisa ikut kena efeknya kalau
+// tidak di-reset eksplisit di sini. Ini perbaikan untuk masalah "font/ukuran
+// uang berubah sendiri saat masuk-keluar kendaraan".
+// ----------------------------------------------------------------------------
+static void ResetFontState(float scaleX, float scaleY, CRGBA color)
+{
+    CFont::SetFontStyle((u8)g_FontStyle);
+    CFont::SetProportional(true);
+    CFont::SetBackground(false, false);
+    CFont::SetJustify(false);
+    CFont::SetOrientation(ALIGN_LEFT);
+    CFont::SetRightJustifyWrap(0.0f);
+    CFont::SetScale(scaleX, scaleY);
+    CFont::SetColor(color);
+}
+
+// ----------------------------------------------------------------------------
 // Gambar 1 bar generik + teks angka opsional
 // ----------------------------------------------------------------------------
-static void DrawCustomBar(const BarConfig& bar, float currentValue)
+static void DrawCustomBar(const BarConfig& bar, float currentValue, bool showRawInsteadOfPercent = false)
 {
     if (!bar.enabled) return;
 
@@ -178,10 +201,16 @@ static void DrawCustomBar(const BarConfig& bar, float currentValue)
     if (bar.showText)
     {
         char buf[16];
-        snprintf(buf, sizeof(buf), "%d", (int)currentValue);
-        CFont::SetScale(0.4f, 0.4f);
-        CFont::SetColor(CRGBA(255, 255, 255, 255));
-        CFont::SetBackground(false, false);
+        // Default: selalu tampilkan skala 0-100 (dinormalisasi dari pct),
+        // supaya semua bar (HP/armor/breath/sprint/veh) konsisten "100" di
+        // puncaknya. Kecuali showRawInsteadOfPercent=true (dipakai VehBar
+        // mode 2) -- itu baru tampilkan nilai asli (0-1000).
+        if (showRawInsteadOfPercent)
+            snprintf(buf, sizeof(buf), "%d", (int)currentValue);
+        else
+            snprintf(buf, sizeof(buf), "%d", (int)(pct * 100.0f));
+
+        ResetFontState(0.4f, 0.4f, CRGBA(255, 255, 255, 255));
         CFont::PrintString(bar.posX + bar.sizeX + 5.0f, bar.posY, buf);
     }
 }
@@ -235,19 +264,27 @@ DECL_HOOKv(CWidgetPlayerInfo__Draw, void* thisWidget)
     CVehicle* pVeh = FindPlayerVehicle(-1, false);
     if (pVeh)
     {
-        DrawCustomBar(g_VehicleHealthBar, pVeh->m_fHealth);
+        // VehBarDisplayMode: 1 = teks 0-100 (normalisasi), 2 = teks 0-1000 (asli)
+        DrawCustomBar(g_VehicleHealthBar, pVeh->m_fHealth, g_VehBarDisplayMode == 2);
     }
 
     if (g_Money.enabled)
     {
         CPlayerInfo& pi = CWorld::Players[(u8)CWorld::PlayerInFocus];
-        char buf[32];
-        snprintf(buf, sizeof(buf), "$%d", pi.m_nDisplayMoney);
-        std::string text = AddSeparators(std::string(buf));
 
-        CFont::SetScale(g_Money.scale, g_Money.scale);
-        CFont::SetColor(CRGBA((u8)g_Money.colorR, (u8)g_Money.colorG, (u8)g_Money.colorB, (u8)g_Money.colorA));
-        CFont::SetBackground(false, false);
+        // PENTING: jangan sertakan '$' di sini -- AddSeparators menghitung
+        // panjang angka untuk menentukan posisi separator, kalau '$' ikut
+        // terhitung sebagai karakter, hasilnya salah (bug "350" jadi ".350"
+        // karena '$'+"350" dianggap 4 karakter, bukan 3). '$' ditambahkan
+        // SETELAH diformat.
+        char buf[32];
+        bool isNegative = pi.m_nDisplayMoney < 0;
+        snprintf(buf, sizeof(buf), "%d", isNegative ? -pi.m_nDisplayMoney : pi.m_nDisplayMoney);
+        std::string text = AddSeparators(std::string(buf));
+        text = (isNegative ? "-$" : "$") + text;
+
+        ResetFontState(g_Money.scale, g_Money.scale,
+            CRGBA((u8)g_Money.colorR, (u8)g_Money.colorG, (u8)g_Money.colorB, (u8)g_Money.colorA));
         CFont::PrintString(g_Money.posX, g_Money.posY, text.c_str());
     }
 }
@@ -259,6 +296,8 @@ ON_MOD_LOAD()
 
     g_bEnabled         = cfg->Bind("Enabled", g_bEnabled, "General")->GetBool();
     g_bUseCustomLayout = cfg->Bind("UseCustomLayout", g_bUseCustomLayout, "General")->GetBool();
+    g_FontStyle         = cfg->Bind("FontStyle", g_FontStyle, "General")->GetInt(); // 0=Gothic 1=Subtitles 2=Menu 3=Pricedown
+    g_VehBarDisplayMode = cfg->Bind("VehBarDisplayMode", g_VehBarDisplayMode, "General")->GetInt(); // 1=0-100 2=0-1000
 
     g_HealthBar.colorR = 255; g_HealthBar.colorG = 0; g_HealthBar.colorB = 0;
     g_HealthBar.maxValue = 100.0f;
@@ -270,7 +309,9 @@ ON_MOD_LOAD()
     LoadBarConfig(g_ArmorBar, "ArmorBar");
 
     g_BreathBar.colorR = 0; g_BreathBar.colorG = 200; g_BreathBar.colorB = 255;
-    g_BreathBar.maxValue = 100.0f; // [VERIFY]
+    // Dikonfirmasi dari mod Lua eksternal (CustomHud.lua, SAMP): nilai maksimum
+    // m_fBreath = 39.97000244 (bukan 100 seperti tebakan sebelumnya).
+    g_BreathBar.maxValue = 39.97000244f;
     g_BreathBar.posY = 70.0f;
     g_BreathBar.enabled = false; // biasanya cuma relevan pas nyelam, default off
     LoadBarConfig(g_BreathBar, "BreathBar");
@@ -281,7 +322,11 @@ ON_MOD_LOAD()
     LoadBarConfig(g_VehicleHealthBar, "VehicleHealthBar");
 
     g_SprintBar.colorR = 0; g_SprintBar.colorG = 255; g_SprintBar.colorB = 100;
-    g_SprintBar.maxValue = 1000.0f; // [VERIFY] skala m_fTimeCanRun
+    // [VERIFY] m_fTimeCanRun TIDAK punya nilai maksimum tetap -- dia naik
+    // seiring stat "Stamina" ped dilatih (lari terus-menerus). Default di
+    // bawah ini cuma perkiraan awal (karakter baru biasanya mulai ~450-500).
+    // Sesuaikan MaxValue di config kalau bar terlihat selalu penuh/kosong.
+    g_SprintBar.maxValue = 450.0f;
     g_SprintBar.posY = 125.0f;
     LoadBarConfig(g_SprintBar, "SprintBar");
 

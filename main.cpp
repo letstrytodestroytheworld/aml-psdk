@@ -1,37 +1,33 @@
 // ============================================================================
 // Custom HUD Mod — GTA SA Mobile (AML), versi 32-bit (armeabi-v7a)
 // ============================================================================
-// DESAIN: setiap elemen HUD (bar HP, armor, breath, vehicle health, sprint,
-// icon senjata, uang) BERDIRI SENDIRI -- masing-masing punya posX/posY/sizeX/
-// sizeY/color sendiri di config, TIDAK saling menempel ke rect manapun.
+// RESTRUKTURISASI: pindah dari hook manual CWidgetPlayerInfo::Draw ke
+// Events::drawHudEvent (API resmi aml-psdk) untuk semua elemen KECUALI
+// icon senjata (masih butuh pointer "this" widget asli -- lihat catatan
+// di bagian g_CachedWidgetThis).
 //
-// Caranya: kita TIDAK memanggil CWidgetPlayerInfo::Draw yang asli sama sekali
-// (kalau mode custom aktif) -- kita gambar ulang semua elemen dari nol pakai
-// CSprite2d::DrawBarChart / DrawWeaponIcon / DrawAmmo / CFont::PrintString,
-// masing-masing dengan koordinat independen dari config.
-//
-// Konsekuensi: jam & bintang wanted TIDAK digambar lagi saat mode custom aktif
-// (karena itu bagian dari CWidgetPlayerInfo::Draw yang kita skip). Set
-// UseCustomLayout=false di config untuk kembali ke HUD 100% default.
-//
-// BAGIAN YANG PERLU KAMU VERIFIKASI/UJI DI DEVICE (ditandai [VERIFY]):
-//   - Skala maksimum CPlayerData::m_fBreath dan m_fTimeCanRun (saya kasih
-//     config MaxValue supaya bisa disetel tanpa compile ulang)
-//   - Urutan parameter DrawWeaponIcon (param pertama tidak jelas fungsinya
-//     dari decompile, saya isi 0)
+// Posisi & ukuran sekarang RESOLUTION-INDEPENDENT: semua angka posisi/ukuran
+// di config dianggap dalam "kanvas referensi" 640x448 (standar lama GTA SA),
+// lalu di-scale otomatis ke resolusi layar device sebenarnya lewat RsGlobal.
+// (Scale font TIDAK ikut di-scale manual -- CFont::SetScale sudah otomatis
+// menyesuaikan resolusi secara internal.)
 // ============================================================================
 
 #include <mod/amlmod.h>
 #include <mod/config.h>
 #include <mod/logger.h>
 #include <aml-psdk/game_sa/plugin.h>
+#include <aml-psdk/game_sa/Events.h>
+#include <aml-psdk/game_sa/engine/RsGlobal.h>
 #include <aml-psdk/game_sa/engine/Font.h>
 #include <aml-psdk/game_sa/engine/Sprite2d.h>
 #include <aml-psdk/game_sa/other/PlayerInfo.h>
 #include <aml-psdk/game_sa/other/PlayerData.h>
+#include <aml-psdk/game_sa/other/Stats.h>
 #include <aml-psdk/game_sa/entity/Ped.h>
 #include <aml-psdk/game_sa/entity/PlayerPed.h>
 #include <aml-psdk/game_sa/entity/Vehicle.h>
+#include <aml-psdk/game_sa/ai/PedIntelligence.h>
 #include <aml-psdk/game_sa/engine/World.h>
 #include <aml-psdk/gta_base/Rect.h>
 #include <string>
@@ -41,90 +37,124 @@
 MYMODCFG(net.psdk.customhud.guid, Custom HUD, 1.0, YourName)
 
 // ----------------------------------------------------------------------------
-// Struct konfigurasi 1 bar (posisi + ukuran + warna, semua independen)
+// Resolution-independent scaling (kanvas referensi 640x448, pola sama persis
+// seperti contoh resmi StaminaBar aml-psdk)
+// ----------------------------------------------------------------------------
+#define SCALEX(__v) ( (__v) * RsGlobal.maximumWidth  / 640.0f )
+#define SCALEY(__v) ( (__v) * RsGlobal.maximumHeight / 448.0f )
+
+// ----------------------------------------------------------------------------
+// Konstanta tetap (bukan setting -- nilai resmi dari engine)
+// ----------------------------------------------------------------------------
+static const float HEALTH_MAX  = 100.0f;
+static const float ARMOUR_MAX  = 100.0f;
+static const float VEHICLE_HEALTH_MAX = 1000.0f;
+static const float BREATH_MAX  = 39.97000244f;
+
+// ----------------------------------------------------------------------------
+// Style teks (independen per elemen)
+// ----------------------------------------------------------------------------
+struct TextStyle
+{
+    bool  enabled  = true;
+    float posX = 0.0f, posY = 0.0f; // dalam kanvas referensi 640x448
+    float scale = 0.4f;
+    int   colorR = 255, colorG = 255, colorB = 255, colorA = 255;
+    int   fontStyle = FONT_GOTHIC;
+    bool  outline = false;
+    int   outlineR = 0, outlineG = 0, outlineB = 0, outlineA = 255;
+};
+
+static void ApplyTextStyle(const TextStyle& t)
+{
+    CFont::SetFontStyle((u8)t.fontStyle);
+    CFont::SetProportional(true);
+    CFont::SetBackground(false, false);
+    CFont::SetJustify(false);
+    CFont::SetOrientation(ALIGN_LEFT);
+    CFont::SetRightJustifyWrap(0.0f);
+    CFont::SetScale(t.scale, t.scale);
+    CFont::SetColor(CRGBA((u8)t.colorR, (u8)t.colorG, (u8)t.colorB, (u8)t.colorA));
+
+    if (t.outline)
+    {
+        CFont::SetDropColor(CRGBA((u8)t.outlineR, (u8)t.outlineG, (u8)t.outlineB, (u8)t.outlineA));
+        CFont::SetEdge(1);
+    }
+    else
+    {
+        CFont::SetEdge(0);
+    }
+}
+
+static void PrintStyledText(const TextStyle& t, const char* text)
+{
+    if (!t.enabled) return;
+    ApplyTextStyle(t);
+    CFont::PrintString(SCALEX(t.posX), SCALEY(t.posY), text);
+}
+
+// ----------------------------------------------------------------------------
+// Konfigurasi 1 bar
 // ----------------------------------------------------------------------------
 struct BarConfig
 {
     bool  enabled  = true;
-    float posX = 20.0f, posY = 20.0f;
-    float sizeX = 200.0f, sizeY = 16.0f;
+    float posX = 20.0f, posY = 20.0f;     // kanvas referensi 640x448
+    float sizeX = 200.0f, sizeY = 16.0f;  // kanvas referensi 640x448
     int   colorR = 255, colorG = 0, colorB = 0, colorA = 255;
-    bool  showText = true;
-    float maxValue = 100.0f; // dipakai untuk hitung persentase
+    TextStyle indicator;
 };
 
-BarConfig g_HealthBar;
-BarConfig g_ArmorBar;
-BarConfig g_BreathBar;
-BarConfig g_VehicleHealthBar;
-BarConfig g_SprintBar;
+BarConfig g_HealthBar, g_ArmorBar, g_BreathBar, g_VehicleHealthBar, g_SprintBar;
+int g_VehBarDisplayMode = 1; // setting KHUSUS VehicleHealthBar: 1=0-100, 2=0-1000
 
 struct WeaponIconConfig
 {
     bool  enabled = true;
     float posX = 20.0f, posY = 250.0f;
-    float sizeX = 60.0f, sizeY = 60.0f;
+    float sizeX = 60.0f, sizeY = 60.0f; // kanvas referensi 640x448
 } g_WeaponIcon;
 
 struct MoneyConfig
 {
     bool  enabled = true;
-    float posX = 20.0f, posY = 320.0f;
-    float scale = 0.5f;
-    int   colorR = 0, colorG = 255, colorB = 0, colorA = 255;
-    int   displayMode = 1;           // 0=off, 1=".000" ribuan, 2=".00" sen
+    int   displayMode = 1;
     std::string separator = ".";
     std::string centSeparator = ".";
+    TextStyle style;
 } g_Money;
 
-bool  g_bEnabled = true;
-bool  g_bUseCustomLayout = true;
-
-int g_FontStyle = FONT_GOTHIC; // 0=Gothic, 1=Subtitles, 2=Menu, 3=Pricedown
-int g_VehBarDisplayMode = 1;   // 1 = tampilkan 0-100 (normalisasi), 2 = tampilkan 0-1000 (nilai asli)
+bool g_bEnabled = true;
 
 // ----------------------------------------------------------------------------
-// Helper: load 1 BarConfig dari section config
+// Cache pointer "this" widget, DITANGKAP lewat hook CWidgetPlayerInfo::Draw,
+// TAPI TIDAK memanggil fungsi aslinya (supaya HUD default tidak dobel
+// tampil bareng elemen custom kita). Dipakai HANYA untuk DrawWeaponIcon,
+// karena fungsi itu tetap butuh pointer widget asli yang valid.
 // ----------------------------------------------------------------------------
-static void LoadBarConfig(BarConfig& bar, const char* section)
-{
-    bar.enabled  = cfg->Bind((std::string(section) + "_Enabled").c_str(), bar.enabled, section)->GetBool();
-    bar.posX     = cfg->Bind((std::string(section) + "_PosX").c_str(), bar.posX, section)->GetFloat();
-    bar.posY     = cfg->Bind((std::string(section) + "_PosY").c_str(), bar.posY, section)->GetFloat();
-    bar.sizeX    = cfg->Bind((std::string(section) + "_SizeX").c_str(), bar.sizeX, section)->GetFloat();
-    bar.sizeY    = cfg->Bind((std::string(section) + "_SizeY").c_str(), bar.sizeY, section)->GetFloat();
-    bar.colorR   = cfg->Bind((std::string(section) + "_ColorR").c_str(), bar.colorR, section)->GetInt();
-    bar.colorG   = cfg->Bind((std::string(section) + "_ColorG").c_str(), bar.colorG, section)->GetInt();
-    bar.colorB   = cfg->Bind((std::string(section) + "_ColorB").c_str(), bar.colorB, section)->GetInt();
-    bar.colorA   = cfg->Bind((std::string(section) + "_ColorA").c_str(), bar.colorA, section)->GetInt();
-    bar.showText = cfg->Bind((std::string(section) + "_ShowText").c_str(), bar.showText, section)->GetBool();
-    bar.maxValue = cfg->Bind((std::string(section) + "_MaxValue").c_str(), bar.maxValue, section)->GetFloat();
-}
+static void* g_CachedWidgetThis = nullptr;
 
-// ----------------------------------------------------------------------------
-// Deklarasi manual fungsi yang belum ada di aml-psdk (hasil decompile IDA,
-// nama simbol dari libGTASA.so 32-bit -- belum di-strip, jadi bisa di-resolve
-// by-name, tahan perubahan versi selama nama simbol tidak berubah).
-// ----------------------------------------------------------------------------
 static inline auto CWidgetPlayerInfo_Draw_Sym =
     GetMainLibrarySymbol<void(*)(void*)>("_ZN17CWidgetPlayerInfo4DrawEv");
 
-// DrawWeaponIcon(CPed*, CRect, float) -- sudah dikonfirmasi lewat IDA (baris
-// EXPORT), ini method non-static CWidgetPlayerInfo, jadi tetap butuh "this"
-// (widget) sebagai argumen pertama (implicit this di ABI fastcall ARM).
 static inline auto DrawWeaponIcon_Sym =
     GetMainLibrarySymbol<void(*)(void*, CPed*, CRect, float)>(
         "_ZN17CWidgetPlayerInfo14DrawWeaponIconEP4CPed5CRectf");
 
+DECL_HOOKv(CWidgetPlayerInfo__Draw, void* thisWidget)
+{
+    g_CachedWidgetThis = thisWidget;
+    // Sengaja TIDAK memanggil CWidgetPlayerInfo__Draw(thisWidget) di sini --
+    // semua render custom kita sekarang dilakukan lewat Events::drawHudEvent.
+}
+
 // ----------------------------------------------------------------------------
-// Money separator (logic sama seperti moneySeparator.cpp)
+// Money separator
 // ----------------------------------------------------------------------------
 static std::string AddSeparators(std::string aValue)
 {
     if (g_Money.displayMode == 0 || aValue.empty()) return aValue;
-
-    bool isNegative = false;
-    while (!aValue.empty() && aValue[0] == '-') { isNegative = true; aValue.erase(0, 1); }
     while (aValue.length() > 1 && aValue[0] == '0') aValue.erase(0, 1);
 
     std::string result;
@@ -155,38 +185,53 @@ static std::string AddSeparators(std::string aValue)
         }
         result = dollars + g_Money.centSeparator + cents;
     }
-    if (isNegative) result = "-" + result;
     return result;
 }
 
 // ----------------------------------------------------------------------------
-// Reset SEMUA state CFont yang relevan sebelum print -- GTA SA pakai state
-// font GLOBAL (bukan per-panggilan), jadi kalau ada elemen lain (misal nama
-// kendaraan/zona yang muncul saat masuk/keluar mobil) ganti style/orientation/
-// justify sebelum giliran kita gambar, teks kita bisa ikut kena efeknya kalau
-// tidak di-reset eksplisit di sini. Ini perbaikan untuk masalah "font/ukuran
-// uang berubah sendiri saat masuk-keluar kendaraan".
+// Helper load config (dipakai untuk semua bar & TextStyle, hindari duplikasi)
 // ----------------------------------------------------------------------------
-static void ResetFontState(float scaleX, float scaleY, CRGBA color)
+static void LoadTextStyle(TextStyle& t, const std::string& prefix)
 {
-    CFont::SetFontStyle((u8)g_FontStyle);
-    CFont::SetProportional(true);
-    CFont::SetBackground(false, false);
-    CFont::SetJustify(false);
-    CFont::SetOrientation(ALIGN_LEFT);
-    CFont::SetRightJustifyWrap(0.0f);
-    CFont::SetScale(scaleX, scaleY);
-    CFont::SetColor(color);
+    t.enabled   = cfg->Bind((prefix + "_Enabled").c_str(), t.enabled, prefix.c_str())->GetBool();
+    t.posX      = cfg->Bind((prefix + "_PosX").c_str(), t.posX, prefix.c_str())->GetFloat();
+    t.posY      = cfg->Bind((prefix + "_PosY").c_str(), t.posY, prefix.c_str())->GetFloat();
+    t.scale     = cfg->Bind((prefix + "_Scale").c_str(), t.scale, prefix.c_str())->GetFloat();
+    t.colorR    = cfg->Bind((prefix + "_ColorR").c_str(), t.colorR, prefix.c_str())->GetInt();
+    t.colorG    = cfg->Bind((prefix + "_ColorG").c_str(), t.colorG, prefix.c_str())->GetInt();
+    t.colorB    = cfg->Bind((prefix + "_ColorB").c_str(), t.colorB, prefix.c_str())->GetInt();
+    t.colorA    = cfg->Bind((prefix + "_ColorA").c_str(), t.colorA, prefix.c_str())->GetInt();
+    t.fontStyle = cfg->Bind((prefix + "_FontStyle").c_str(), t.fontStyle, prefix.c_str())->GetInt();
+    t.outline   = cfg->Bind((prefix + "_Outline").c_str(), t.outline, prefix.c_str())->GetBool();
+    t.outlineR  = cfg->Bind((prefix + "_OutlineR").c_str(), t.outlineR, prefix.c_str())->GetInt();
+    t.outlineG  = cfg->Bind((prefix + "_OutlineG").c_str(), t.outlineG, prefix.c_str())->GetInt();
+    t.outlineB  = cfg->Bind((prefix + "_OutlineB").c_str(), t.outlineB, prefix.c_str())->GetInt();
+    t.outlineA  = cfg->Bind((prefix + "_OutlineA").c_str(), t.outlineA, prefix.c_str())->GetInt();
+}
+
+static void LoadBarConfig(BarConfig& bar, const std::string& section)
+{
+    bar.enabled = cfg->Bind((section + "_Enabled").c_str(), bar.enabled, section.c_str())->GetBool();
+    bar.posX    = cfg->Bind((section + "_PosX").c_str(), bar.posX, section.c_str())->GetFloat();
+    bar.posY    = cfg->Bind((section + "_PosY").c_str(), bar.posY, section.c_str())->GetFloat();
+    bar.sizeX   = cfg->Bind((section + "_SizeX").c_str(), bar.sizeX, section.c_str())->GetFloat();
+    bar.sizeY   = cfg->Bind((section + "_SizeY").c_str(), bar.sizeY, section.c_str())->GetFloat();
+    bar.colorR  = cfg->Bind((section + "_ColorR").c_str(), bar.colorR, section.c_str())->GetInt();
+    bar.colorG  = cfg->Bind((section + "_ColorG").c_str(), bar.colorG, section.c_str())->GetInt();
+    bar.colorB  = cfg->Bind((section + "_ColorB").c_str(), bar.colorB, section.c_str())->GetInt();
+    bar.colorA  = cfg->Bind((section + "_ColorA").c_str(), bar.colorA, section.c_str())->GetInt();
+    LoadTextStyle(bar.indicator, section + "_Indicator");
 }
 
 // ----------------------------------------------------------------------------
-// Gambar 1 bar generik + teks angka opsional
+// Gambar 1 bar + indicator
 // ----------------------------------------------------------------------------
-static void DrawCustomBar(const BarConfig& bar, float currentValue, bool showRawInsteadOfPercent = false)
+static void DrawCustomBar(const BarConfig& bar, float currentValue, float maxValue,
+                           bool showRawInsteadOfPercent = false)
 {
     if (!bar.enabled) return;
 
-    float pct = currentValue / bar.maxValue;
+    float pct = currentValue / maxValue;
     if (pct < 0.0f) pct = 0.0f;
     if (pct > 1.0f) pct = 1.0f;
 
@@ -194,98 +239,18 @@ static void DrawCustomBar(const BarConfig& bar, float currentValue, bool showRaw
     CRGBA bgColor(0, 0, 0, 150);
 
     CSprite2d::DrawBarChart(
-        bar.posX, bar.posY,
-        (u16)bar.sizeX, (u8)bar.sizeY,
+        SCALEX(bar.posX), SCALEY(bar.posY),
+        (u16)SCALEX(bar.sizeX), (u8)SCALEY(bar.sizeY),
         pct * 100.0f, 0, 0, 1, color, bgColor);
 
-    if (bar.showText)
+    if (bar.indicator.enabled)
     {
         char buf[16];
-        // Default: selalu tampilkan skala 0-100 (dinormalisasi dari pct),
-        // supaya semua bar (HP/armor/breath/sprint/veh) konsisten "100" di
-        // puncaknya. Kecuali showRawInsteadOfPercent=true (dipakai VehBar
-        // mode 2) -- itu baru tampilkan nilai asli (0-1000).
         if (showRawInsteadOfPercent)
             snprintf(buf, sizeof(buf), "%d", (int)currentValue);
         else
             snprintf(buf, sizeof(buf), "%d", (int)(pct * 100.0f));
-
-        ResetFontState(0.4f, 0.4f, CRGBA(255, 255, 255, 255));
-        CFont::PrintString(bar.posX + bar.sizeX + 5.0f, bar.posY, buf);
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Hook utama
-// ----------------------------------------------------------------------------
-DECL_HOOKv(CWidgetPlayerInfo__Draw, void* thisWidget)
-{
-    if (!g_bEnabled || !g_bUseCustomLayout)
-    {
-        // Mode default: pakai HUD asli 100% (jam, wanted, semuanya normal)
-        CWidgetPlayerInfo__Draw(thisWidget);
-        return;
-    }
-
-    // Mode custom: SKIP fungsi asli sepenuhnya, gambar semua dari nol.
-    // (Efeknya: jam & bintang wanted tidak tampil di mode ini.)
-
-    CPlayerPed* pPed = FindPlayerPed(-1);
-    if (pPed)
-    {
-        // m_PlayerData ada di CPlayerInfo (bukan di CPed/CPlayerPed), jadi
-        // diakses lewat CWorld::Players, bukan lewat pPed langsung.
-        CPlayerInfo& pInfo = CWorld::Players[(u8)CWorld::PlayerInFocus];
-
-        DrawCustomBar(g_HealthBar, pPed->m_fHealth);
-        DrawCustomBar(g_ArmorBar, pPed->m_fArmour);
-        DrawCustomBar(g_BreathBar, pInfo.m_PlayerData.m_fBreath);      // [VERIFY skala max]
-        DrawCustomBar(g_SprintBar, pInfo.m_PlayerData.m_fTimeCanRun);  // [VERIFY skala max]
-
-        if (g_WeaponIcon.enabled)
-        {
-            if (DrawWeaponIcon_Sym)
-            {
-                CRect rect(g_WeaponIcon.posX, g_WeaponIcon.posY,
-                           g_WeaponIcon.posX + g_WeaponIcon.sizeX,
-                           g_WeaponIcon.posY + g_WeaponIcon.sizeY);
-                DrawWeaponIcon_Sym(thisWidget, pPed, rect, 255.0f);
-            }
-            else
-            {
-                // Simbol DrawWeaponIcon belum ketemu/salah nama -- matikan
-                // otomatis supaya tidak crash berulang, sampai nama simbol
-                // yang benar dikonfirmasi lewat IDA.
-                g_WeaponIcon.enabled = false;
-            }
-        }
-    }
-
-    CVehicle* pVeh = FindPlayerVehicle(-1, false);
-    if (pVeh)
-    {
-        // VehBarDisplayMode: 1 = teks 0-100 (normalisasi), 2 = teks 0-1000 (asli)
-        DrawCustomBar(g_VehicleHealthBar, pVeh->m_fHealth, g_VehBarDisplayMode == 2);
-    }
-
-    if (g_Money.enabled)
-    {
-        CPlayerInfo& pi = CWorld::Players[(u8)CWorld::PlayerInFocus];
-
-        // PENTING: jangan sertakan '$' di sini -- AddSeparators menghitung
-        // panjang angka untuk menentukan posisi separator, kalau '$' ikut
-        // terhitung sebagai karakter, hasilnya salah (bug "350" jadi ".350"
-        // karena '$'+"350" dianggap 4 karakter, bukan 3). '$' ditambahkan
-        // SETELAH diformat.
-        char buf[32];
-        bool isNegative = pi.m_nDisplayMoney < 0;
-        snprintf(buf, sizeof(buf), "%d", isNegative ? -pi.m_nDisplayMoney : pi.m_nDisplayMoney);
-        std::string text = AddSeparators(std::string(buf));
-        text = (isNegative ? "-$" : "$") + text;
-
-        ResetFontState(g_Money.scale, g_Money.scale,
-            CRGBA((u8)g_Money.colorR, (u8)g_Money.colorG, (u8)g_Money.colorB, (u8)g_Money.colorA));
-        CFont::PrintString(g_Money.posX, g_Money.posY, text.c_str());
+        PrintStyledText(bar.indicator, buf);
     }
 }
 
@@ -294,40 +259,27 @@ ON_MOD_LOAD()
 {
     logger->SetTag("CustomHUD");
 
-    g_bEnabled         = cfg->Bind("Enabled", g_bEnabled, "General")->GetBool();
-    g_bUseCustomLayout = cfg->Bind("UseCustomLayout", g_bUseCustomLayout, "General")->GetBool();
-    g_FontStyle         = cfg->Bind("FontStyle", g_FontStyle, "General")->GetInt(); // 0=Gothic 1=Subtitles 2=Menu 3=Pricedown
-    g_VehBarDisplayMode = cfg->Bind("VehBarDisplayMode", g_VehBarDisplayMode, "General")->GetInt(); // 1=0-100 2=0-1000
+    g_bEnabled = cfg->Bind("Enabled", g_bEnabled, "General")->GetBool();
 
     g_HealthBar.colorR = 255; g_HealthBar.colorG = 0; g_HealthBar.colorB = 0;
-    g_HealthBar.maxValue = 100.0f;
+    g_HealthBar.indicator.posX = 225; g_HealthBar.indicator.posY = 20;
     LoadBarConfig(g_HealthBar, "HealthBar");
 
     g_ArmorBar.colorR = 0; g_ArmorBar.colorG = 150; g_ArmorBar.colorB = 255;
-    g_ArmorBar.maxValue = 100.0f;
-    g_ArmorBar.posY = 45.0f;
+    g_ArmorBar.posY = 45; g_ArmorBar.indicator.posX = 225; g_ArmorBar.indicator.posY = 45;
     LoadBarConfig(g_ArmorBar, "ArmorBar");
 
     g_BreathBar.colorR = 0; g_BreathBar.colorG = 200; g_BreathBar.colorB = 255;
-    // Dikonfirmasi dari mod Lua eksternal (CustomHud.lua, SAMP): nilai maksimum
-    // m_fBreath = 39.97000244 (bukan 100 seperti tebakan sebelumnya).
-    g_BreathBar.maxValue = 39.97000244f;
-    g_BreathBar.posY = 70.0f;
-    g_BreathBar.enabled = false; // biasanya cuma relevan pas nyelam, default off
+    g_BreathBar.posY = 70; g_BreathBar.indicator.posX = 225; g_BreathBar.indicator.posY = 70;
     LoadBarConfig(g_BreathBar, "BreathBar");
 
     g_VehicleHealthBar.colorR = 255; g_VehicleHealthBar.colorG = 165; g_VehicleHealthBar.colorB = 0;
-    g_VehicleHealthBar.maxValue = 1000.0f; // CVehicle::m_fHealth full = 1000
-    g_VehicleHealthBar.posY = 100.0f;
+    g_VehicleHealthBar.posY = 100; g_VehicleHealthBar.indicator.posX = 225; g_VehicleHealthBar.indicator.posY = 100;
     LoadBarConfig(g_VehicleHealthBar, "VehicleHealthBar");
+    g_VehBarDisplayMode = cfg->Bind("VehicleHealthBar_DisplayMode", g_VehBarDisplayMode, "VehicleHealthBar")->GetInt();
 
     g_SprintBar.colorR = 0; g_SprintBar.colorG = 255; g_SprintBar.colorB = 100;
-    // [VERIFY] m_fTimeCanRun TIDAK punya nilai maksimum tetap -- dia naik
-    // seiring stat "Stamina" ped dilatih (lari terus-menerus). Default di
-    // bawah ini cuma perkiraan awal (karakter baru biasanya mulai ~450-500).
-    // Sesuaikan MaxValue di config kalau bar terlihat selalu penuh/kosong.
-    g_SprintBar.maxValue = 450.0f;
-    g_SprintBar.posY = 125.0f;
+    g_SprintBar.posY = 125; g_SprintBar.indicator.posX = 225; g_SprintBar.indicator.posY = 125;
     LoadBarConfig(g_SprintBar, "SprintBar");
 
     g_WeaponIcon.enabled = cfg->Bind("WeaponIcon_Enabled", g_WeaponIcon.enabled, "WeaponIcon")->GetBool();
@@ -337,13 +289,10 @@ ON_MOD_LOAD()
     g_WeaponIcon.sizeY   = cfg->Bind("WeaponIcon_SizeY", g_WeaponIcon.sizeY, "WeaponIcon")->GetFloat();
 
     g_Money.enabled     = cfg->Bind("Money_Enabled", g_Money.enabled, "Money")->GetBool();
-    g_Money.posX        = cfg->Bind("Money_PosX", g_Money.posX, "Money")->GetFloat();
-    g_Money.posY        = cfg->Bind("Money_PosY", g_Money.posY, "Money")->GetFloat();
-    g_Money.scale        = cfg->Bind("Money_Scale", g_Money.scale, "Money")->GetFloat();
-    g_Money.colorR      = cfg->Bind("Money_ColorR", g_Money.colorR, "Money")->GetInt();
-    g_Money.colorG      = cfg->Bind("Money_ColorG", g_Money.colorG, "Money")->GetInt();
-    g_Money.colorB      = cfg->Bind("Money_ColorB", g_Money.colorB, "Money")->GetInt();
     g_Money.displayMode = cfg->Bind("Money_DisplayMode", g_Money.displayMode, "Money")->GetInt();
+    g_Money.style.posX = 20; g_Money.style.posY = 320;
+    g_Money.style.colorR = 0; g_Money.style.colorG = 255; g_Money.style.colorB = 0;
+    LoadTextStyle(g_Money.style, "Money");
 
     uintptr_t pGame = aml->GetLib("libGTASA.so");
     if (!pGame)
@@ -355,7 +304,55 @@ ON_MOD_LOAD()
     HOOK(CWidgetPlayerInfo__Draw, CWidgetPlayerInfo_Draw_Sym);
 
     if (!DrawWeaponIcon_Sym)
-        logger->Error("DrawWeaponIcon symbol NOT FOUND -- WeaponIcon dinonaktifkan otomatis. Perlu cek nama simbol yang benar di IDA.");
+        logger->Error("DrawWeaponIcon symbol NOT FOUND -- WeaponIcon dinonaktifkan otomatis.");
 
-    logger->Info("Custom HUD loaded (fully independent layout mode).");
+    // ------------------------------------------------------------------
+    // Event resmi aml-psdk, dipanggil tiap frame saat HUD digambar
+    // ------------------------------------------------------------------
+    Events::drawHudEvent += []()
+    {
+        if (!g_bEnabled) return;
+
+        CPlayerPed* pPed = FindPlayerPed(-1);
+        if (pPed)
+        {
+            DrawCustomBar(g_HealthBar, pPed->m_fHealth, HEALTH_MAX);
+            DrawCustomBar(g_ArmorBar, pPed->m_fArmour, ARMOUR_MAX);
+
+            if (pPed->m_pIntelligence && pPed->m_pIntelligence->GetTaskSwim() && pPed->m_pPlayerData)
+                DrawCustomBar(g_BreathBar, pPed->m_pPlayerData->m_fBreath, BREATH_MAX);
+
+            if (pPed->m_pPlayerData)
+            {
+                float stamina = pPed->m_pPlayerData->m_fTimeCanRun;
+                float maxStamina = CStats::GetFatAndMuscleModifier(STAT_MOD_TIME_CAN_RUN);
+                DrawCustomBar(g_SprintBar, stamina, maxStamina);
+            }
+
+            if (g_WeaponIcon.enabled && DrawWeaponIcon_Sym && g_CachedWidgetThis)
+            {
+                CRect rect(SCALEX(g_WeaponIcon.posX), SCALEY(g_WeaponIcon.posY),
+                           SCALEX(g_WeaponIcon.posX + g_WeaponIcon.sizeX),
+                           SCALEY(g_WeaponIcon.posY + g_WeaponIcon.sizeY));
+                DrawWeaponIcon_Sym(g_CachedWidgetThis, pPed, rect, 255.0f);
+            }
+        }
+
+        CVehicle* pVeh = FindPlayerVehicle(-1, false);
+        if (pVeh)
+            DrawCustomBar(g_VehicleHealthBar, pVeh->m_fHealth, VEHICLE_HEALTH_MAX, g_VehBarDisplayMode == 2);
+
+        if (g_Money.enabled)
+        {
+            CPlayerInfo& pi = CWorld::Players[(u8)CWorld::PlayerInFocus];
+            bool isNegative = pi.m_nDisplayMoney < 0;
+            char buf[32];
+            snprintf(buf, sizeof(buf), "%d", isNegative ? -pi.m_nDisplayMoney : pi.m_nDisplayMoney);
+            std::string text = AddSeparators(std::string(buf));
+            text = (isNegative ? "-$" : "$") + text;
+            PrintStyledText(g_Money.style, text.c_str());
+        }
+    };
+
+    logger->Info("Custom HUD loaded (Events::drawHudEvent architecture).");
 }

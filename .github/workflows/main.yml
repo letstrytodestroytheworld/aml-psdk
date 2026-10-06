@@ -1,0 +1,60 @@
+name: AML PSDK Mod Compiler
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Checkout repository (with aml-psdk submodule if present)...
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
+
+    # aml-psdk (Android.mk, Application.mk, folder aml-psdk/) diasumsikan
+    # SUDAH ada di root repo ini (baik lewat submodule di atas, atau
+    # ter-commit langsung). Kalau repomu belum punya aml-psdk sama sekali,
+    # un-comment 2 step di bawah ini untuk download otomatis dari RusJJ/aml-psdk:
+    #
+    # - name: Download aml-psdk template...
+    #   uses: wei/wget@v1
+    #   with:
+    #     args: -O ./aml-psdk_src.zip https://github.com/RusJJ/aml-psdk/archive/refs/heads/main.zip
+    #
+    # - name: Extract aml-psdk template...
+    #   run: |
+    #     unzip -o ./aml-psdk_src.zip
+    #     cp -rn ./aml-psdk-main/* ./
+    #     rm -rf ./aml-psdk-main ./aml-psdk_src.zip
+
+    - name: Download AndroidModLoader's mod template (mod/ folder)...
+      uses: wei/wget@v1
+      with:
+        args: -O ./AML_src.zip https://github.com/RusJJ/AndroidModLoader/archive/refs/heads/main.zip
+
+    - name: Install AndroidModLoader's mod template...
+      run: |
+        unzip -o ./AML_src.zip
+        rm -rf ./mod
+        mv ./AndroidModLoader-main/mod ./mod
+        rm -rf ./AndroidModLoader-main ./AML_src.zip
+
+    - name: Install Android NDK (r27d)...
+      uses: nttld/setup-ndk@v1.2.0
+      with:
+        ndk-version: r27d
+        local-cache: true
+
+    - name: Build the code...
+      run: ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=./Android.mk NDK_APPLICATION_MK=./Application.mk NDK_DEBUG=0 -j12
+
+    - name: Upload the mod!
+      uses: actions/upload-artifact@v4
+      with:
+        name: compiled-mod
+        path: ./libs
